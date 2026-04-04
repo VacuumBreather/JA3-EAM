@@ -1,24 +1,19 @@
+-- Factory function to create the pathfinding penalty wrapper
 function ApplyPathfindingPenalty(old_GetSectorTravelTime, side, end_sector)
     return function(from, to, ...)
         local time, t1, t2, breakdown = old_GetSectorTravelTime(from, to, ...)
         
-        -- Check if 'time' is valid (not false/nil)
         if time then
-            -- CUSTOM LOGIC: High cost for enemy pathfinding through player/militia sectors
             local is_enemy = side == "enemy1" or side == "diamonds"
             
             if is_enemy and to then
-                -- 1. Check for physical presence of player/allied squads
-                -- We exclude travelling squads as they aren't "in" the sector to block it effectively
+                -- Check for presence of player squads or militia
                 local player_squads = GetSquadsInSector(to, true, false, true, true)
                 local has_player_squads = #player_squads > 0
-                
-                -- 2. Check for physical presence of militia
                 local has_militia = GetSectorMilitiaCount(to) > 0
                 
-                -- If player mercs OR militia are present, apply the penalty
-                -- Do not apply it if the sector is the final destination (to allow attacks)
-                if to ~= end_sector and (has_player_squads or has_militia) then
+                -- Apply the penalty floor (1,000,000) unless it's the target destination
+                if has_player_squads or has_militia then
                     time = 2500000
                 end
             end
@@ -28,40 +23,41 @@ function ApplyPathfindingPenalty(old_GetSectorTravelTime, side, end_sector)
     end
 end
 
-local old_GenerateRouteDijkstra = GenerateRouteDijkstra
-
-function GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
+-- Wrapper to safely swap the global and execute a function
+local function ExecuteWithPathfindingPenalty(side, end_sector, original_func, ...)
     local old_GetSectorTravelTime = GetSectorTravelTime
-    GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side, end_sector)
-    
-    local route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
-    
-    GetSectorTravelTime = old_GetSectorTravelTime
+    local penalty_func = ApplyPathfindingPenalty(old_GetSectorTravelTime, side, end_sector)
 
-    if not route then
-        print("ATTENTION: Alt-Route necessary (GenerateRouteDijkstra)")
-        route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
+    -- Use rawset to bypass strict mode global assignment check
+    rawset(_G, "GetSectorTravelTime", penalty_func)
+
+    -- Use pcall to ensure restoration even on errors
+    local ok, route = pcall(original_func, ...)
+
+    -- Restore the original global
+    rawset(_G, "GetSectorTravelTime", old_GetSectorTravelTime)
+
+    if not ok then
+        -- Log the error if the pathfinding crashed
+        print("Pathfinding Error: " .. tostring(route))
+        return false
     end
-    
+
     return route
 end
 
+-- Monkey Patch for Standard Pathfinding
+local old_GenerateRouteDijkstra = GenerateRouteDijkstra
+function GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
+    return ExecuteWithPathfindingPenalty(side, end_sector, old_GenerateRouteDijkstra, 
+        start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
+end
+
+-- Monkey Patch for Diamond Shipment Pathfinding
 local old_GenerateRouteDijkstraSimplified = GenerateRouteDijkstraSimplified
-
 function GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
-    local old_GetSectorTravelTime = GetSectorTravelTime
-    GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side, end_sector)
-    
-    local route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
-    
-    GetSectorTravelTime = old_GetSectorTravelTime
-
-    if not route then
-        print("ATTENTION: Alt-Route necessary (GenerateRouteDijkstraSimplified)")
-        route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
-    end
-    
-    return route
+    return ExecuteWithPathfindingPenalty(side, end_sector, old_GenerateRouteDijkstraSimplified, 
+        start_sector, end_sector, pass_mode, side, ...)
 end
 
 Queue = {}
@@ -171,13 +167,15 @@ function OnMsg.LoadSessionData()
     ReconstructPath("A2", "F7", came_from)
 end
 
--- local old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
+local old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
 
--- function SpawnDynamicDBSquad(...)
---     if db_cache_dirty then
---         DBRoutesCacheDynamic = nil -- Clear to force rebuild
---         GenerateDynamicDBPathCache()
---         db_cache_dirty = false
---     end
---     return old_SpawnDynamicDBSquad(...)
--- end
+function SpawnDynamicDBSquad(...)
+    if db_cache_dirty then
+        if DBRoutesCacheDynamic then
+            rawset(_G, "DBRoutesCacheDynamic", nil) -- Clear to force rebuild
+        end
+        GenerateDynamicDBPathCache()
+        db_cache_dirty = false
+    end
+    return old_SpawnDynamicDBSquad(...)
+end
