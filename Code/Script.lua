@@ -72,46 +72,45 @@ function GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, si
     return route
 end
 
--- Priority Queue
-
 -- Priority Queue (Min-Heap)
 local PriorityQueue = {}
 PriorityQueue.__index = PriorityQueue
 
-local function PriorityQueue.new()
-  return setmetatable({ _heap = {}, _size = 0 }, PriorityQueue)
+function PriorityQueue.new()
+  return setmetatable({ _values = {}, _priorities = {}, _size = 0 }, PriorityQueue)
 end
 
 -- Swap two elements in the heap
-local function swap(heap, i, j)
-  heap[i], heap[j] = heap[j], heap[i]
+local function swap(self, i, j)
+  self._values[i], self._values[j] = self._values[j], self._values[i]
+  self._priorities[i], self._priorities[j] = self._priorities[j], self._priorities[i]
 end
 
 -- Bubble up to restore heap property after insertion
-local function siftUp(heap, i)
+local function siftUp(self, i)
   while i > 1 do
     local parent = math.floor(i / 2)
-    if heap[parent].priority <= heap[i].priority then break end
-    swap(heap, parent, i)
+    if self._priorities[parent] <= self._priorities[i] then break end
+    swap(self, parent, i)
     i = parent
   end
 end
 
 -- Bubble down to restore heap property after removal
-local function siftDown(heap, i, size)
+local function siftDown(self, i, size)
   while true do
     local smallest = i
     local left, right = 2 * i, 2 * i + 1
 
-    if left <= size and heap[left].priority < heap[smallest].priority then
+    if left <= size and self._priorities[left] < self._priorities[smallest] then
       smallest = left
     end
-    if right <= size and heap[right].priority < heap[smallest].priority then
+    if right <= size and self._priorities[right] < self._priorities[smallest] then
       smallest = right
     end
 
     if smallest == i then break end
-    swap(heap, i, smallest)
+    swap(self, i, smallest)
     i = smallest
   end
 end
@@ -119,23 +118,30 @@ end
 -- Insert a value with a given priority (lower number = higher priority)
 function PriorityQueue:put(value, priority)
   self._size = self._size + 1
-  self._heap[self._size] = { value = value, priority = priority }
-  siftUp(self._heap, self._size)
+  self._values[self._size] = value
+  self._priorities[self._size] = priority
+  siftUp(self, self._size)
 end
 
 -- Remove and return the highest-priority (lowest number) element
 function PriorityQueue:pop()
   if self._size == 0 then return nil end
 
-  local top = self._heap[1]
-  self._heap[1] = self._heap[self._size]
-  self._heap[self._size] = nil
+  local val = self._values[1]
+  local prio = self._priorities[1]
+  
+  self._values[1] = self._values[self._size]
+  self._priorities[1] = self._priorities[self._size]
+  
+  self._values[self._size] = nil
+  self._priorities[self._size] = nil
+  
   self._size = self._size - 1
   if self._size > 0 then
-    siftDown(self._heap, 1, self._size)
+    siftDown(self, 1, self._size)
   end
 
-  return top.value, top.priority
+  return val, prio
 end
 
 function PriorityQueue:isEmpty()
@@ -323,7 +329,7 @@ function GenerateDynamicDBPathCache_Optimized()
     -- Restore protection and print only the FINAL result
     ResumeInfiniteLoopDetection("DBPathfinding")
     print(string.format("DB Cache Rebuilt: %d routes in %d ms", #routeCache, GetPreciseTicks() - st))
-    CombatLog("DBPathfinding", string.format("DB Cache Rebuilt old way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
+    CombatLog("DBPathfinding", string.format("DB Cache Rebuilt new way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
 end
 
 local old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
