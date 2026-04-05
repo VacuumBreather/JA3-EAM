@@ -1,3 +1,8 @@
+--- Generates a pathfinding penalty function to deter enemy squads from sectors with player/militia presence.
+--- @param old_GetSectorTravelTime function The original travel time calculation function.
+--- @param side string The side (faction) currently performing pathfinding.
+--- @param cached_presence table|nil Optional pre-calculated presence data (sector_id -> boolean).
+--- @return function A wrapped travel time function that applies high costs to guarded sectors.
 function ApplyPathfindingPenalty(old_GetSectorTravelTime, side, cached_presence)
     return function(from, to, ...)
         local time, t1, t2, breakdown = old_GetSectorTravelTime(from, to, ...)
@@ -13,13 +18,14 @@ function ApplyPathfindingPenalty(old_GetSectorTravelTime, side, cached_presence)
                 if cached_presence then
                     has_presence = cached_presence[to]
                 else
-                    -- 1. Check for physical presence of player/allied squads
+                    -- Fallback: Check for physical presence of player/allied squads or militia
                     -- We exclude travelling squads as they aren't "in" the sector to block it effectively
-                    local player_or_militia_squads = GetSquadsInSector(id, true, true, true, true)
+                    local player_or_militia_squads = GetSquadsInSector(to, true, true, true, true)
                     has_presence = #player_or_militia_squads > 0
                 end
 
-                -- If player mercs OR militia are present, apply the penalty
+                -- If player mercs OR militia are present, apply a significant penalty floor.
+                -- Using 2,500,000 as a "soft-block" cost (approx. 115 hours).
                 if has_presence then
                     time = Max(tonumber(time) or 0, 2500000)
                 end
@@ -32,15 +38,19 @@ end
 
 local old_GenerateRouteDijkstra = GenerateRouteDijkstra
 
+--- Standard satellite pathfinding monkey patch to apply penalties.
 function GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
     local old_GetSectorTravelTime = GetSectorTravelTime
+    -- Temporarily override the global GetSectorTravelTime to influence the Dijkstra search
     GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side)
 
     local route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
 
+    -- Restore the original function immediately to avoid side effects
     GetSectorTravelTime = old_GetSectorTravelTime
 
     if not route then
+        -- If no path was found with penalties, retry without them to prevent squads from getting stuck
         route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
 
         if route then
@@ -53,15 +63,19 @@ end
 
 local old_GenerateRouteDijkstraSimplified = GenerateRouteDijkstraSimplified
 
+--- Diamond shipment pathfinding monkey patch to apply penalties.
 function GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
     local old_GetSectorTravelTime = GetSectorTravelTime
+    -- Temporarily override the global GetSectorTravelTime
     GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side)
 
     local route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
 
+    -- Restore the original function
     GetSectorTravelTime = old_GetSectorTravelTime
 
     if not route then
+        -- Fallback to original logic if penalty-aware pathfinding fails
         route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
 
         if route then
@@ -72,40 +86,44 @@ function GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, si
     return route
 end
 
--- Priority Queue (Min-Heap)
+--- Priority Queue (Min-Heap) implementation optimized for reduced GC pressure.
 local PriorityQueue = {}
 PriorityQueue.__index = PriorityQueue
 
+--- Creates a new PriorityQueue instance.
 function PriorityQueue.new()
   return setmetatable({ _values = {}, _priorities = {}, _size = 0 }, PriorityQueue)
 end
 
--- Swap two elements in the heap
+--- Internal helper to swap two elements in the heap.
 local function swap(self, i, j)
-  self._values[i], self._values[j] = self._values[j], self._values[i]
-  self._priorities[i], self._priorities[j] = self._priorities[j], self._priorities[i]
+  local values, priorities = self._values, self._priorities
+  values[i], values[j] = values[j], values[i]
+  priorities[i], priorities[j] = priorities[j], priorities[i]
 end
 
--- Bubble up to restore heap property after insertion
+--- Internal helper to restore heap property by moving an element up.
 local function siftUp(self, i)
+  local priorities = self._priorities
   while i > 1 do
-    local parent = math.floor(i / 2)
-    if self._priorities[parent] <= self._priorities[i] then break end
+    local parent = i >> 1 -- Bitwise shift for faster math.floor(i / 2)
+    if priorities[parent] <= priorities[i] then break end
     swap(self, parent, i)
     i = parent
   end
 end
 
--- Bubble down to restore heap property after removal
+--- Internal helper to restore heap property by moving an element down.
 local function siftDown(self, i, size)
+  local priorities = self._priorities
   while true do
     local smallest = i
-    local left, right = 2 * i, 2 * i + 1
+    local left, right = i << 1, (i << 1) + 1 -- Bitwise shifts for children
 
-    if left <= size and self._priorities[left] < self._priorities[smallest] then
+    if left <= size and priorities[left] < priorities[smallest] then
       smallest = left
     end
-    if right <= size and self._priorities[right] < self._priorities[smallest] then
+    if right <= size and priorities[right] < priorities[smallest] then
       smallest = right
     end
 
@@ -115,40 +133,52 @@ local function siftDown(self, i, size)
   end
 end
 
--- Insert a value with a given priority (lower number = higher priority)
+--- Inserts a value into the queue with a numeric priority.
+--- @param value any The data to store.
+--- @param priority number Lower values have higher priority.
 function PriorityQueue:put(value, priority)
-  self._size = self._size + 1
-  self._values[self._size] = value
-  self._priorities[self._size] = priority
-  siftUp(self, self._size)
+  local size = self._size + 1
+  self._size = size
+  self._values[size] = value
+  self._priorities[size] = priority
+  siftUp(self, size)
 end
 
--- Remove and return the highest-priority (lowest number) element
+--- Removes and returns the highest-priority element and its priority.
+--- @return any|nil, number|nil The stored value and its priority, or nil if empty.
 function PriorityQueue:pop()
-  if self._size == 0 then return nil end
+  local size = self._size
+  if size == 0 then return nil end
 
-  local val = self._values[1]
-  local prio = self._priorities[1]
+  local values, priorities = self._values, self._priorities
+  local val, prio = values[1], priorities[1]
   
-  self._values[1] = self._values[self._size]
-  self._priorities[1] = self._priorities[self._size]
+  values[1] = values[size]
+  priorities[1] = priorities[size]
   
-  self._values[self._size] = nil
-  self._priorities[self._size] = nil
+  values[size] = nil
+  priorities[size] = nil
   
-  self._size = self._size - 1
-  if self._size > 0 then
-    siftDown(self, 1, self._size)
+  size = size - 1
+  self._size = size
+  if size > 0 then
+    siftDown(self, 1, size)
   end
 
   return val, prio
 end
 
+--- Checks if the queue is empty.
 function PriorityQueue:isEmpty()
   return self._size == 0
 end
 
 --Priority Queue end
+--- Performs a one-to-all Dijkstra search to calculate path costs from a source sector.
+--- @param from string The starting sector ID.
+--- @param getNeighbours function A function that returns adjacent sectors (sector_id -> direction).
+--- @param getCost function A function that returns the travel cost between two adjacent sectors.
+--- @return table A table of parent pointers (sector_id -> previous_sector_id) for path reconstruction.
 local function DijkstraSearch(from, getNeighbours, getCost)
     local frontier = PriorityQueue.new()
     frontier:put(from, 0)
@@ -166,8 +196,7 @@ local function DijkstraSearch(from, getNeighbours, getCost)
 
                 if (not cost_so_far[next_sector]) or new_cost < cost_so_far[next_sector] then
                     cost_so_far[next_sector] = new_cost
-                    local priority = new_cost
-                    frontier:put(next_sector, priority)
+                    frontier:put(next_sector, new_cost)
                     came_from[next_sector] = current
                 end
             end
@@ -177,24 +206,29 @@ local function DijkstraSearch(from, getNeighbours, getCost)
     return came_from
 end
 
+--- Reconstructs a path from the source to a target using 'came_from' data.
+--- @param from string The source sector ID.
+--- @param to string The target sector ID.
+--- @param came_from table The result of a DijkstraSearch.
+--- @return table An ordered list of sector IDs from from to to.
 local function ReconstructPath(from, to, came_from)
     local current = to
     local path = {}
 
+    -- Backtrack from the destination to the source
     while current and current ~= from and current ~= "NONE" do
         path[#path + 1] = current
         current = came_from[current]
     end
 
-    -- Verify if we actually reached the start
+    -- Verify if we actually reached the source
     if current ~= from and current ~= "NONE" then
-        return {} -- Return empty path if no route was found
+        return {} -- Return empty path if unreachable
     end
 
-    -- Reverse the table
+    -- Reverse the path in-place to get Source -> Destination order
     local n = #path
-
-    for i = 1, math.floor(n / 2) do
+    for i = 1, n >> 1 do
         local j = n - i + 1
         path[i], path[j] = path[j], path[i]
     end
@@ -216,8 +250,10 @@ function OnMsg.LoadSessionData()
     db_cache_dirty = true
 end
 
+--- Rebuilds the Diamond Briefcase shipment route cache using optimized one-to-all searches.
+--- This implementation respects player/militia presence by applying high pathfinding costs.
 function GenerateDynamicDBPathCache_Optimized()
-    -- Enable engine protection
+    -- Enable engine protection to prevent timeout during heavy calculations
 	PauseInfiniteLoopDetection("DBPathfinding")
 
 	local st = GetPreciseTicks()
@@ -230,10 +266,9 @@ function GenerateDynamicDBPathCache_Optimized()
 	local rows = campaign.sector_rows
     local minRouteLength = 10
 
-    -- Cache player and militia presence
-    for id, sector in pairs(gv_Sectors) do
+    -- Cache player and militia presence once to avoid expensive engine calls in the inner loops
+    for id, _ in pairs(gv_Sectors) do
         local player_or_militia_squads = GetSquadsInSector(id, true, true, true, true)
-
         if #player_or_militia_squads > 0 then
             cached_presence[id] = true
         end
@@ -248,21 +283,21 @@ function GenerateDynamicDBPathCache_Optimized()
 
             local row, col = sector_unpack(id)
 
-            -- Check for map edges
+            -- Identify potential exit sectors (marked or map boundaries)
             if sector.DBDestinationSector or row == rows or col == cols or row == 1 or col == 1 then
                 destinations[#destinations + 1] = id
             end
         end
     end
 
-    -- Check if we can build routes at all
+    -- Safety check: ensure both sources and destinations exist
 	if #sources == 0 or #destinations == 0 then
 		DBRoutesCacheDynamic = {}
         ResumeInfiniteLoopDetection("DBPathfinding")
 		return
 	end
 
-    -- Cache the cost function for speed
+    -- Prepare the cost evaluation closure
     local base_travel_time = GetSectorTravelTime
     local penalty_travel_time = ApplyPathfindingPenalty(base_travel_time, "diamonds", cached_presence)
 
@@ -273,7 +308,7 @@ function GenerateDynamicDBPathCache_Optimized()
 
     local dedupe = {}
 
-    -- The Optimized Loop
+    -- Main optimization loop: O(Sources * Dijkstra) instead of O(Sources * Destinations * Dijkstra)
     for _, src in ipairs(sources) do
         local came_from = DijkstraSearch(src, GetNeighborSectors, getCost)
         for _, dest in ipairs(destinations) do
@@ -282,37 +317,33 @@ function GenerateDynamicDBPathCache_Optimized()
 
                 if not route or #route == 0 then goto continue end
 
-                -- Shave off weird looking routes at the edge of the map.
-                if destinations[dest] == "edge" then
-                    local edgeSectorsToRemove = 0
+                -- Shave off redundant movements along the map boundary.
+                -- This ensures shipments exit at the first available edge sector.
+                local edgeSectorsToRemove = 0
+                for i = #route, 1, -1 do
+                    local sectorId = route[i]
+                    local row, col = sector_unpack(sectorId)
+                    local isEdgeSector = row == rows or col == cols or row == 1 or col == 1
 
-                    for i = #route, 1, -1 do
-                        local sectorId = route[i]
-                        local row, col = sector_unpack(sectorId)
-                        local isEdgeSector = row == rows or cols == col or row == 1 or col == 1
-
-                        if isEdgeSector then
-                            edgeSectorsToRemove = edgeSectorsToRemove + 1
-                        else
-                            break
-                        end
-                    end
-
-                    if edgeSectorsToRemove > 1 then
-                        local routeLength = #route
-
-                        for i = 0, edgeSectorsToRemove - 2 do
-                            route[routeLength - i] = nil
-                        end
-
-                        dest = route[#route]
+                    if isEdgeSector then
+                        edgeSectorsToRemove = edgeSectorsToRemove + 1
+                    else
+                        break
                     end
                 end
 
-                -- Prevent duplication
+                if edgeSectorsToRemove > 1 then
+                    local routeLength = #route
+                    for i = 0, edgeSectorsToRemove - 2 do
+                        route[routeLength - i] = nil
+                    end
+                    dest = route[#route]
+                end
+
+                -- Prevent storing identical routes in the cache
                 if dedupe[src .. " " .. dest] then goto continue end
 
-                -- The route should be at least minRouteLength long.
+                -- Enforce minimum travel distance to keep shipments on the map
                 if #route >= minRouteLength then
                     route.source, route.dest = src, dest
                     dedupe[src .. " " .. dest] = true
@@ -326,21 +357,23 @@ function GenerateDynamicDBPathCache_Optimized()
 
     DBRoutesCacheDynamic = routeCache
 
-    -- Restore protection and print only the FINAL result
+    -- Restore engine infinite loop protection
     ResumeInfiniteLoopDetection("DBPathfinding")
-    print(string.format("DB Cache Rebuilt: %d routes in %d ms", #routeCache, GetPreciseTicks() - st))
-    CombatLog("DBPathfinding", string.format("DB Cache Rebuilt new way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
+    print(string.format("[EAM] DB Cache Rebuilt: %d routes in %d ms", #routeCache, GetPreciseTicks() - st))
+    CombatLog("DBPathfinding", string.format("DB Cache Rebuilt: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
 end
 
 local old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
 
+--- Overrides the standard Diamond Shipment spawner to ensure the cache is refreshed when dirty.
 function SpawnDynamicDBSquad(...)
     if db_cache_dirty then
 	    local st = GetPreciseTicks()
+        -- Force the game to rebuild its base cache if needed, though we primarily use our optimized one
         DBRoutesCacheDynamic = nil
         GenerateDynamicDBPathCache()
-        print(string.format("DB Cache Rebuilt old way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
-        CombatLog("DBPathfinding", string.format("DB Cache Rebuilt old way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
+        
+        -- Run our optimized pathfinding rebuild
         GenerateDynamicDBPathCache_Optimized()
         db_cache_dirty = false
     end
