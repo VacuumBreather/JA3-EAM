@@ -236,27 +236,13 @@ local function ReconstructPath(from, to, came_from)
     return path
 end
 
-local db_cache_dirty = true
-
-function OnMsg.SectorSideChanged()
-    db_cache_dirty = true
-end
-
-function OnMsg.InitSessionCampaignObjects()
-    db_cache_dirty = true
-end
-
-function OnMsg.LoadSessionData()
-    db_cache_dirty = true
-end
-
 --- Rebuilds the Diamond Briefcase shipment route cache using optimized one-to-all searches.
 --- This implementation respects player/militia presence by applying high pathfinding costs.
 function GenerateDynamicDBPathCache_Optimized()
     -- Enable engine protection to prevent timeout during heavy calculations
 	PauseInfiniteLoopDetection("DBPathfinding")
 
-	local st = GetPreciseTicks()
+	--local st = GetPreciseTicks()
 	local routeCache = {}
 	local sources = {}
 	local destinations = {}
@@ -359,23 +345,15 @@ function GenerateDynamicDBPathCache_Optimized()
 
     -- Restore engine infinite loop protection
     ResumeInfiniteLoopDetection("DBPathfinding")
-    print(string.format("[EAM] DB Cache Rebuilt: %d routes in %d ms", #routeCache, GetPreciseTicks() - st))
-    CombatLog("DBPathfinding", string.format("DB Cache Rebuilt: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
+    -- print(string.format("[EAM] DB Cache Rebuilt: %d routes in %d ms", #routeCache, GetPreciseTicks() - st))
+    -- CombatLog("DBPathfinding", string.format("DB Cache Rebuilt: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
 end
 
 local old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
 
---- Overrides the standard Diamond Shipment spawner to ensure the cache is refreshed when dirty.
+--- Overrides the standard Diamond Shipment spawner to ensure the cache is refreshed
 function SpawnDynamicDBSquad(...)
-    if db_cache_dirty then
-	    local st = GetPreciseTicks()
-        -- Force the game to rebuild its base cache if needed, though we primarily use our optimized one
-        DBRoutesCacheDynamic = nil
-        GenerateDynamicDBPathCache()
-        
-        -- Run our optimized pathfinding rebuild
-        GenerateDynamicDBPathCache_Optimized()
-        db_cache_dirty = false
-    end
+    -- Run optimized pathfinding rebuild
+    GenerateDynamicDBPathCache_Optimized()
     return old_SpawnDynamicDBSquad(...)
 end
