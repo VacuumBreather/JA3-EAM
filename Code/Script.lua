@@ -1,29 +1,31 @@
-function ApplyPathfindingPenalty(old_GetSectorTravelTime, side)
+function ApplyPathfindingPenalty(old_GetSectorTravelTime, side, cached_presence)
     return function(from, to, ...)
         local time, t1, t2, breakdown = old_GetSectorTravelTime(from, to, ...)
-        
+
         -- Check if 'time' is valid (not false/nil)
         if time then
             -- CUSTOM LOGIC: High cost for enemy pathfinding through player/militia sectors
             local is_enemy = side == "enemy1" or side == "diamonds"
-            
+
             if is_enemy and to then
-                -- 1. Check for physical presence of player/allied squads
-                -- We exclude travelling squads as they aren't "in" the sector to block it effectively
-                local player_squads = GetSquadsInSector(to, true, false, true, true)
-                local has_player_squads = #player_squads > 0
-                
-                -- 2. Check for physical presence of militia
-                local has_militia = GetSectorMilitiaCount(to) > 0
-                
+                local has_presence = false
+
+                if cached_presence then
+                    has_presence = cached_presence[to]
+                else
+                    -- 1. Check for physical presence of player/allied squads
+                    -- We exclude travelling squads as they aren't "in" the sector to block it effectively
+                    local player_or_militia_squads = GetSquadsInSector(id, true, true, true, true)
+                    has_presence = #player_or_militia_squads > 0
+                end
+
                 -- If player mercs OR militia are present, apply the penalty
-                -- Do not apply it if the sector is the final destination (to allow attacks)
-                if has_player_squads or has_militia then
-                    time = 2500000
+                if has_presence then
+                    time = Max(tonumber(time) or 0, 2500000)
                 end
             end
         end
-        
+
         return time, t1, t2, breakdown
     end
 end
@@ -33,19 +35,19 @@ local old_GenerateRouteDijkstra = GenerateRouteDijkstra
 function GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
     local old_GetSectorTravelTime = GetSectorTravelTime
     GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side)
-    
+
     local route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
-    
+
     GetSectorTravelTime = old_GetSectorTravelTime
 
     if not route then
         route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
 
-        if route then            
-            print("ATTENTION: Alt-Route necessary (GenerateRouteDijkstra)")
+        if route then
+            print(string.format("[EAM] [Warning] Fallback pathfinding was necessary to find a route from %s to %s", start_sector, end_sector))
         end
     end
-    
+
     return route
 end
 
@@ -54,19 +56,19 @@ local old_GenerateRouteDijkstraSimplified = GenerateRouteDijkstraSimplified
 function GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
     local old_GetSectorTravelTime = GetSectorTravelTime
     GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side)
-    
+
     local route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
-    
+
     GetSectorTravelTime = old_GetSectorTravelTime
 
     if not route then
         route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
 
-        if route then            
-            print("ATTENTION: Alt-Route necessary (GenerateRouteDijkstra)")
+        if route then
+            print(string.format("[EAM] [Warning] Fallback pathfinding was necessary to find a route from %s to %s", start_sector, end_sector))
         end
     end
-    
+
     return route
 end
 
@@ -76,7 +78,7 @@ end
 local PriorityQueue = {}
 PriorityQueue.__index = PriorityQueue
 
-function PriorityQueue.new()
+local function PriorityQueue.new()
   return setmetatable({ _heap = {}, _size = 0 }, PriorityQueue)
 end
 
@@ -136,23 +138,12 @@ function PriorityQueue:pop()
   return top.value, top.priority
 end
 
--- Peek at the top element without removing it
-function PriorityQueue:peek()
-  if self._size == 0 then return nil end
-  return self._heap[1].value, self._heap[1].priority
-end
-
 function PriorityQueue:isEmpty()
   return self._size == 0
 end
 
-function PriorityQueue:size()
-  return self._size
-end
-
 --Priority Queue end
 local function DijkstraSearch(from, getNeighbours, getCost)
-    local count = 1
     local frontier = PriorityQueue.new()
     frontier:put(from, 0)
     local came_from = { [from] = "NONE" }
@@ -160,9 +151,7 @@ local function DijkstraSearch(from, getNeighbours, getCost)
 
     while not frontier:isEmpty() do
         local current = frontier:pop()
-        count = count + 1
 
-        -- Iterate through neighboring sectors
         for next_sector, _ in pairs(getNeighbours(current)) do
             local travel_cost = getCost(current, next_sector)
 
@@ -179,9 +168,6 @@ local function DijkstraSearch(from, getNeighbours, getCost)
         end
     end
 
-    CombatLog("important", string.format("Checked %d sectors", count))
-    print(string.format("Checked %d sectors", count))
-
     return came_from
 end
 
@@ -189,20 +175,25 @@ local function ReconstructPath(from, to, came_from)
     local current = to
     local path = {}
 
-    while current ~= from and current ~= "NONE" do
+    while current and current ~= from and current ~= "NONE" do
         path[#path + 1] = current
         current = came_from[current]
     end
 
+    -- Verify if we actually reached the start
+    if current ~= from and current ~= "NONE" then
+        return {} -- Return empty path if no route was found
+    end
+
     -- Reverse the table
     local n = #path
+
     for i = 1, math.floor(n / 2) do
         local j = n - i + 1
         path[i], path[j] = path[j], path[i]
     end
-    
-    CombatLog("important", table.concat(path, " -> "))
-    print(table.concat(path, " -> "))
+
+    return path
 end
 
 local db_cache_dirty = true
@@ -220,77 +211,130 @@ function OnMsg.LoadSessionData()
 end
 
 function GenerateDynamicDBPathCache_Optimized()
+    -- Enable engine protection
 	PauseInfiniteLoopDetection("DBPathfinding")
+
 	local st = GetPreciseTicks()
 	local routeCache = {}
 	local sources = {}
 	local destinations = {}
+    local cached_presence = {}
 	local campaign = GetCurrentCampaignPreset()
 	local cols = campaign.sector_columns
 	local rows = campaign.sector_rows
-
     local minRouteLength = 10
-	
-	for id, sector in sorted_pairs(gv_Sectors) do
-		if IsSectorUnderground(id) then goto continue end
-		
-		if sector.DBSourceSector and not sources[id] then
-			sources[#sources + 1] = id
-			sources[id] = "src"
-		end
-		
-		local row, col = sector_unpack(id)
-		local isEdgeSector = row == rows or cols == col or row == 1 or col == 1
-		if (sector.DBDestinationSector or isEdgeSector) and not destinations[id] then
-			destinations[#destinations + 1] = id
-			destinations[id] = isEdgeSector and "edge" or "dest"
-		end
-		
-		::continue::
-	end
-	
-	if #sources == 0 or #destinations == 0 then 
+
+    -- Cache player and militia presence
+    for id, sector in pairs(gv_Sectors) do
+        local player_or_militia_squads = GetSquadsInSector(id, true, true, true, true)
+
+        if #player_or_militia_squads > 0 then
+            cached_presence[id] = true
+        end
+    end
+
+	-- Build Source and Destination lists
+    for id, sector in sorted_pairs(gv_Sectors) do
+        if not IsSectorUnderground(id) then
+            if sector.DBSourceSector then
+                sources[#sources + 1] = id
+            end
+
+            local row, col = sector_unpack(id)
+
+            -- Check for map edges
+            if sector.DBDestinationSector or row == rows or col == cols or row == 1 or col == 1 then
+                destinations[#destinations + 1] = id
+            end
+        end
+    end
+
+    -- Check if we can build routes at all
+	if #sources == 0 or #destinations == 0 then
 		DBRoutesCacheDynamic = {}
+        ResumeInfiniteLoopDetection("DBPathfinding")
 		return
 	end
 
-	local source_lookups = {}
-    local getTravelTime = ApplyPathfindingPenalty(GetSectorTravelTime, "diamonds")
-    local getCost = function(from, to)
-        local dir = GetSectorDirection(from, to)
-        return GetSectorTravelTime(from, to, nil, nil, "land_water_boatless", nil, "diamonds", dir)
+    -- Cache the cost function for speed
+    local base_travel_time = GetSectorTravelTime
+    local penalty_travel_time = ApplyPathfindingPenalty(base_travel_time, "diamonds", cached_presence)
+
+    local getCost = function(f, t)
+        local dir = GetSectorDirection(f, t)
+        return penalty_travel_time(f, t, nil, nil, "land_water_boatless", nil, "diamonds", dir)
     end
 
-	for _, source in ipairs(sources) do
-        local came_from = DijkstraSearch(source, GetNeighborSectors, getCost)
-        source_lookups[source] = came_from
-    end
+    local dedupe = {}
 
-    for _, source in ipairs(sources) do
+    -- The Optimized Loop
+    for _, src in ipairs(sources) do
+        local came_from = DijkstraSearch(src, GetNeighborSectors, getCost)
         for _, dest in ipairs(destinations) do
-			if source == dest then goto continue end
+            if src ~= dest then
+                local route = ReconstructPath(src, dest, came_from)
 
-            local route = ReconstructPath(source, dest, source_lookups[source])
+                if not route or #route == 0 then goto continue end
 
-            if #route >= minRouteLength then
-				route.source = source
-				route.dest = dest
-				routeCache[#routeCache + 1] = route
-			end
+                -- Shave off weird looking routes at the edge of the map.
+                if destinations[dest] == "edge" then
+                    local edgeSectorsToRemove = 0
 
-			::continue::
+                    for i = #route, 1, -1 do
+                        local sectorId = route[i]
+                        local row, col = sector_unpack(sectorId)
+                        local isEdgeSector = row == rows or cols == col or row == 1 or col == 1
+
+                        if isEdgeSector then
+                            edgeSectorsToRemove = edgeSectorsToRemove + 1
+                        else
+                            break
+                        end
+                    end
+
+                    if edgeSectorsToRemove > 1 then
+                        local routeLength = #route
+
+                        for i = 0, edgeSectorsToRemove - 2 do
+                            route[routeLength - i] = nil
+                        end
+
+                        dest = route[#route]
+                    end
+                end
+
+                -- Prevent duplication
+                if dedupe[src .. " " .. dest] then goto continue end
+
+                -- The route should be at least minRouteLength long.
+                if #route >= minRouteLength then
+                    route.source, route.dest = src, dest
+                    dedupe[src .. " " .. dest] = true
+                    routeCache[#routeCache + 1] = route
+                end
+            end
+
+            ::continue::
         end
     end
 
     DBRoutesCacheDynamic = routeCache
-	print(string.format("GenerateDynamicDBPathCache finished after: %d ms/n", GetPreciseTicks() - st))
-	ResumeInfiniteLoopDetection("DBPathfinding")
+
+    -- Restore protection and print only the FINAL result
+    ResumeInfiniteLoopDetection("DBPathfinding")
+    print(string.format("DB Cache Rebuilt: %d routes in %d ms", #routeCache, GetPreciseTicks() - st))
+    CombatLog("DBPathfinding", string.format("DB Cache Rebuilt old way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
 end
 
 local old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
 
 function SpawnDynamicDBSquad(...)
     if db_cache_dirty then
+	    local st = GetPreciseTicks()
+        DBRoutesCacheDynamic = nil
+        GenerateDynamicDBPathCache()
+        print(string.format("DB Cache Rebuilt old way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
+        CombatLog("DBPathfinding", string.format("DB Cache Rebuilt old way: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
         GenerateDynamicDBPathCache_Optimized()
         db_cache_dirty = false
     end
