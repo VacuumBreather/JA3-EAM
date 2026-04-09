@@ -1,11 +1,23 @@
+local eam_old_GetSectorTravelTime = GetSectorTravelTime
+local eam_penaltyFn = nil  -- active penalty function, or nil for passthrough
+
+function GetSectorTravelTime(...)
+    if eam_penaltyFn then
+        return eam_penaltyFn(...)
+    end
+
+    return eam_old_GetSectorTravelTime(...)
+end
+
+
 --- Generates a pathfinding penalty function to deter enemy squads from sectors with player/militia presence.
---- @param old_GetSectorTravelTime function The original travel time calculation function.
+--- @param eam_old_GetSectorTravelTime function The original travel time calculation function.
 --- @param side string The side (faction) currently performing pathfinding.
 --- @param cached_presence table|nil Optional pre-calculated presence data (sector_id -> boolean).
 --- @return function A wrapped travel time function that applies high costs to guarded sectors.
-function ApplyPathfindingPenalty(old_GetSectorTravelTime, side, cached_presence)
+function ApplyPathfindingPenalty(eam_old_GetSectorTravelTime, side, cached_presence)
     return function(from, to, ...)
-        local time, t1, t2, breakdown = old_GetSectorTravelTime(from, to, ...)
+        local time, t1, t2, breakdown = eam_old_GetSectorTravelTime(from, to, ...)
 
         -- Check if 'time' is valid (not false/nil)
         if time then
@@ -36,22 +48,19 @@ function ApplyPathfindingPenalty(old_GetSectorTravelTime, side, cached_presence)
     end
 end
 
-local old_GenerateRouteDijkstra = GenerateRouteDijkstra
+local eam_old_GenerateRouteDijkstra = GenerateRouteDijkstra
 
 --- Standard satellite pathfinding monkey patch to apply penalties.
 function GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
-    local old_GetSectorTravelTime = GetSectorTravelTime
-    -- Temporarily override the global GetSectorTravelTime to influence the Dijkstra search
-    GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side)
+    eam_penaltyFn = ApplyPathfindingPenalty(eam_old_GetSectorTravelTime, side)
 
-    local route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
+    local route = eam_old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
 
-    -- Restore the original function immediately to avoid side effects
-    GetSectorTravelTime = old_GetSectorTravelTime
+    eam_penaltyFn = nil  -- restore passthrough
 
     if not route then
         -- If no path was found with penalties, retry without them to prevent squads from getting stuck
-        route = old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
+        route = eam_old_GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_mode, squad_curr_sector, side, noShortcuts)
 
         if route then
             print(string.format("[EAM] [Warning] Fallback pathfinding was necessary to find a route from %s to %s", start_sector, end_sector))
@@ -61,22 +70,19 @@ function GenerateRouteDijkstra(start_sector, end_sector, fullRoute, units, pass_
     return route
 end
 
-local old_GenerateRouteDijkstraSimplified = GenerateRouteDijkstraSimplified
+local eam_old_GenerateRouteDijkstraSimplified = GenerateRouteDijkstraSimplified
 
 --- Diamond shipment pathfinding monkey patch to apply penalties.
 function GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
-    local old_GetSectorTravelTime = GetSectorTravelTime
-    -- Temporarily override the global GetSectorTravelTime
-    GetSectorTravelTime = ApplyPathfindingPenalty(old_GetSectorTravelTime, side)
+    eam_penaltyFn = ApplyPathfindingPenalty(eam_old_GetSectorTravelTime, side)
 
-    local route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
+    local route = eam_old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
 
-    -- Restore the original function
-    GetSectorTravelTime = old_GetSectorTravelTime
+    eam_penaltyFn = nil  -- restore passthrough
 
     if not route then
         -- Fallback to original logic if penalty-aware pathfinding fails
-        route = old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
+        route = eam_old_GenerateRouteDijkstraSimplified(start_sector, end_sector, pass_mode, side, ...)
 
         if route then
             print(string.format("[EAM] [Warning] Fallback pathfinding was necessary to find a route from %s to %s", start_sector, end_sector))
@@ -341,7 +347,7 @@ function GenerateDynamicDBPathCache_Optimized()
         end
     end
 
-    DBRoutesCacheDynamic = routeCache
+    rawset(_G, "DBRoutesCacheDynamic", routeCache)
 
     -- Restore engine infinite loop protection
     ResumeInfiniteLoopDetection("DBPathfinding")
@@ -349,11 +355,11 @@ function GenerateDynamicDBPathCache_Optimized()
     -- CombatLog("DBPathfinding", string.format("DB Cache Rebuilt: %d routes in %d ms", #DBRoutesCacheDynamic, GetPreciseTicks() - st))
 end
 
-local old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
+local eam_old_SpawnDynamicDBSquad = SpawnDynamicDBSquad
 
 --- Overrides the standard Diamond Shipment spawner to ensure the cache is refreshed
 function SpawnDynamicDBSquad(...)
     -- Run optimized pathfinding rebuild
     GenerateDynamicDBPathCache_Optimized()
-    return old_SpawnDynamicDBSquad(...)
+    return eam_old_SpawnDynamicDBSquad(...)
 end
